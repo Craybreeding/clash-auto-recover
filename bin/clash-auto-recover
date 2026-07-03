@@ -1,0 +1,801 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+SOCKET="${CLASH_SOCKET:-/tmp/verge/verge-mihomo.sock}"
+APP_NAME="${CLASH_APP_NAME:-Clash Verge}"
+LOG_DIR="${CLASH_RECOVER_LOG_DIR:-$HOME/Library/Logs/clash-recover}"
+STATE_DIR="${CLASH_RECOVER_STATE_DIR:-$HOME/.local/state/clash-recover}"
+LOCK_DIR="$STATE_DIR/lock"
+FAIL_FILE="$STATE_DIR/fail-count"
+LAST_RECOVER_FILE="$STATE_DIR/last-recover"
+LAST_RESTART_FILE="$STATE_DIR/last-restart"
+LAST_DAILY_REFRESH_FILE="$STATE_DIR/last-daily-refresh-success"
+DESIRED_TUN_FILE="$STATE_DIR/desired-tun"
+APP_SUPPORT_DIR="${CLASH_APP_SUPPORT_DIR:-$HOME/Library/Application Support/io.github.clash-verge-rev.clash-verge-rev}"
+PROFILES_YAML="$APP_SUPPORT_DIR/profiles.yaml"
+PROFILE_DIR="$APP_SUPPORT_DIR/profiles"
+MODE="${1:-health}"
+
+mkdir -p "$LOG_DIR" "$STATE_DIR"
+LOG_FILE="$LOG_DIR/recover.log"
+
+if [[ -z "${CLASH_FALLBACK_PROXY:-}" && -f "$STATE_DIR/fallback-proxy" ]]; then
+  CLASH_FALLBACK_PROXY="$(tr -d '\r\n' < "$STATE_DIR/fallback-proxy")"
+fi
+
+log() {
+  printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$LOG_FILE"
+}
+
+api() {
+  local method="$1"
+  local path="$2"
+  local data="${3:-}"
+  if [[ -n "$data" ]]; then
+    curl --max-time 8 --unix-socket "$SOCKET" -sS \
+      -X "$method" -H 'Content-Type: application/json' \
+      -d "$data" "http://127.0.0.1${path}"
+  else
+    curl --max-time 8 --unix-socket "$SOCKET" -sS \
+      -X "$method" "http://127.0.0.1${path}"
+  fi
+}
+
+api_code() {
+  local method="$1"
+  local path="$2"
+  local data="${3:-}"
+  if [[ -n "$data" ]]; then
+    curl --max-time 8 --unix-socket "$SOCKET" -sS -o /dev/null \
+      -w '%{http_code}' -X "$method" -H 'Content-Type: application/json' \
+      -d "$data" "http://127.0.0.1${path}"
+  else
+    curl --max-time 8 --unix-socket "$SOCKET" -sS -o /dev/null \
+      -w '%{http_code}' -X "$method" "http://127.0.0.1${path}"
+  fi
+}
+
+urlencode() {
+  jq -rn --arg v "$1" '$v|@uri'
+}
+
+proxy_port() {
+  local port
+  port="$(api GET /configs 2>/dev/null | jq -r '(.["mixed-port"] // .port // .["socks-port"] // 0)' 2>/dev/null || echo 0)"
+  if [[ "$port" =~ ^[0-9]+$ ]] && (( port > 0 )); then
+    printf '%s\n' "$port"
+    return 0
+  fi
+  port="$(system_proxy_port)"
+  if [[ "$port" =~ ^[0-9]+$ ]] && (( port > 0 )); then
+    printf '%s\n' "$port"
+    return 0
+  fi
+  printf '7897\n'
+}
+
+system_proxy_port() {
+  scutil --proxy 2>/dev/null |
+    awk '
+      /HTTPPort|HTTPSPort|SOCKSPort/ {
+        value=$3
+        if (value ~ /^[0-9]+$/ && value > 0) {
+          print value
+          exit
+        }
+      }
+    '
+}
+
+system_proxy_url() {
+  scutil --proxy 2>/dev/null |
+    awk '
+      /HTTPProxy|HTTPSProxy|SOCKSProxy/ {
+        if (host == "") {
+          host=$3
+        }
+      }
+      /HTTPPort|HTTPSPort|SOCKSPort/ {
+        if (port == "" && $3 ~ /^[0-9]+$/ && $3 > 0) {
+          port=$3
+        }
+      }
+      END {
+        if (host != "" && port != "") {
+          print "http://" host ":" port
+        }
+      }
+    '
+}
+
+is_local_proxy_url() {
+  local proxy_url="$1"
+  [[ "$proxy_url" =~ ^https?://(127\.0\.0\.1|localhost):[0-9]+$ ]]
+}
+
+tun_enabled() {
+  api GET /configs 2>/dev/null | jq -r '.tun.enable // false'
+}
+
+system_proxy_enabled() {
+  scutil --proxy 2>/dev/null | grep -Eq '(HTTPEnable|HTTPSEnable|SOCKSEnable) : 1'
+}
+
+network_services() {
+  networksetup -listallnetworkservices 2>/dev/null |
+    tail -n +2 |
+    sed '/^\*/d'
+}
+
+set_system_proxy_off() {
+  local svc
+  log "system proxy: off"
+  while IFS= read -r svc; do
+    [[ -z "$svc" ]] && continue
+    networksetup -setwebproxystate "$svc" off >/dev/null 2>&1 || true
+    networksetup -setsecurewebproxystate "$svc" off >/dev/null 2>&1 || true
+    networksetup -setsocksfirewallproxystate "$svc" off >/dev/null 2>&1 || true
+  done < <(network_services)
+}
+
+set_system_proxy_on() {
+  local port="$1"
+  local svc
+  log "system proxy: on 127.0.0.1:${port}"
+  while IFS= read -r svc; do
+    [[ -z "$svc" ]] && continue
+    networksetup -setwebproxy "$svc" 127.0.0.1 "$port" off >/dev/null 2>&1 || true
+    networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$port" off >/dev/null 2>&1 || true
+    networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$port" off >/dev/null 2>&1 || true
+    networksetup -setwebproxystate "$svc" on >/dev/null 2>&1 || true
+    networksetup -setsecurewebproxystate "$svc" on >/dev/null 2>&1 || true
+    networksetup -setsocksfirewallproxystate "$svc" on >/dev/null 2>&1 || true
+  done < <(network_services)
+}
+
+set_tun() {
+  local enabled="$1"
+  log "tun: ${enabled}"
+  api PATCH /configs "{\"tun\":{\"enable\":${enabled}}}" >/dev/null 2>&1 || true
+  sleep 1
+}
+
+desired_system_proxy_enabled() {
+  [[ "${CLASH_RECOVER_REENABLE_SYSTEM_PROXY:-1}" == "1" ]]
+}
+
+should_reenable_tun() {
+  local original_tun="$1"
+  [[ "${CLASH_RECOVER_REENABLE_TUN:-preserve}" == "1" || "$original_tun" == "true" ]]
+}
+
+reenable_ready_proxy() {
+  local port="$1"
+  local original_tun="$2"
+  if should_reenable_tun "$original_tun"; then
+    set_tun true
+  fi
+  if desired_system_proxy_enabled; then
+    set_system_proxy_on "$port"
+  fi
+}
+
+start_app_if_needed() {
+  if api GET /version >/dev/null 2>&1; then
+    return 0
+  fi
+  log "controller unavailable; opening ${APP_NAME}"
+  open -a "$APP_NAME" >/dev/null 2>&1 || true
+  sleep 6
+  if api GET /version >/dev/null 2>&1; then
+    return 0
+  fi
+  start_core_directly
+}
+
+proxy_port_listening() {
+  local port="$1"
+  nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+}
+
+start_core_directly() {
+  local core_bin config_file
+  core_bin="${CLASH_CORE_BIN:-/Applications/${APP_NAME}.app/Contents/MacOS/verge-mihomo}"
+  config_file="${CLASH_CONFIG_FILE:-$APP_SUPPORT_DIR/clash-verge.yaml}"
+  if [[ ! -x "$core_bin" || ! -r "$config_file" ]]; then
+    log "core fallback unavailable: bin=${core_bin} config=${config_file}"
+    return 1
+  fi
+  if pgrep -f "[v]erge-mihomo.*clash-verge.yaml" >/dev/null 2>&1; then
+    sleep 3
+  else
+    log "core fallback: starting verge-mihomo directly"
+    nohup "$core_bin" -d "$APP_SUPPORT_DIR" -f "$config_file" >> "$LOG_DIR/core-fallback.log" 2>&1 &
+    sleep 8
+  fi
+  api GET /version >/dev/null 2>&1
+}
+
+restart_clash_app() {
+  local now last min_interval
+  min_interval="${CLASH_RECOVER_RESTART_MIN_INTERVAL:-300}"
+  now="$(date '+%s')"
+  last="$(cat "$LAST_RESTART_FILE" 2>/dev/null || echo 0)"
+  if (( now - last < min_interval )); then
+    log "clash restart suppressed by min interval"
+    return 1
+  fi
+
+  log "clash restart: quit/open ${APP_NAME}"
+  osascript -e "tell application \"${APP_NAME}\" to quit" >/dev/null 2>&1 || true
+  sleep 3
+  open -a "$APP_NAME" >/dev/null 2>&1 || true
+  sleep 8
+  api GET /version >/dev/null 2>&1 || start_core_directly || true
+  date '+%s' > "$LAST_RESTART_FILE"
+}
+
+http_reachable_code() {
+  local code="$1"
+  [[ "$code" =~ ^(200|204|301|302|307|308|401|403)$ ]]
+}
+
+HEALTH_URLS=(
+  "https://www.gstatic.com/generate_204"
+  "https://github.com"
+  "https://api.github.com"
+  "https://api.openai.com/v1/models"
+  "https://generativelanguage.googleapis.com/v1beta/models"
+)
+
+health_total() {
+  local rounds="${1:-1}"
+  printf '%s\n' "$((${#HEALTH_URLS[@]} * rounds))"
+}
+
+health_min_ok() {
+  local rounds="${1:-1}"
+  local total min_ok
+  total="$(health_total "$rounds")"
+  min_ok="${CLASH_RECOVER_MIN_OK:-$((4 * rounds))}"
+  if (( min_ok > total )); then
+    min_ok="$total"
+  fi
+  printf '%s\n' "$min_ok"
+}
+
+check_proxy_health() {
+  local port="$1"
+  check_proxy_url_health "http://127.0.0.1:${port}" "${2:-6}" "${3:-${CLASH_RECOVER_HEALTH_ROUNDS:-2}}"
+}
+
+check_proxy_url_health() {
+  local proxy_url="$1"
+  local timeout="${2:-6}"
+  local rounds="${3:-${CLASH_RECOVER_HEALTH_ROUNDS:-2}}"
+  local ok=0
+  local code
+  local round url
+  for ((round = 1; round <= rounds; round++)); do
+    for url in "${HEALTH_URLS[@]}"; do
+      code="$(curl --connect-timeout "$timeout" --max-time "$timeout" -x "$proxy_url" -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+      if http_reachable_code "$code"; then
+        ok=$((ok + 1))
+      fi
+    done
+  done
+  printf '%s\n' "$ok"
+}
+
+set_system_proxy_url() {
+  local proxy_url="$1"
+  local host port
+  IFS=$'\t' read -r host port < <(ruby -ruri -e '
+    uri = URI(ARGV.fetch(0))
+    abort "only http/https proxy URLs are supported" unless %w[http https].include?(uri.scheme)
+    abort "authenticated proxy URLs are not supported" if uri.user || uri.password
+    abort "missing host or port" if uri.host.to_s.empty? || uri.port.nil?
+    puts [uri.host, uri.port].join("\t")
+  ' "$proxy_url" 2>/dev/null) || return 2
+  [[ -z "$host" || -z "$port" || "$host" == "$port" ]] && return 2
+  local svc
+  log "system proxy: on ${host}:${port}"
+  while IFS= read -r svc; do
+    [[ -z "$svc" ]] && continue
+    networksetup -setwebproxy "$svc" "$host" "$port" off >/dev/null 2>&1 || true
+    networksetup -setsecurewebproxy "$svc" "$host" "$port" off >/dev/null 2>&1 || true
+    networksetup -setsocksfirewallproxy "$svc" "$host" "$port" off >/dev/null 2>&1 || true
+    networksetup -setwebproxystate "$svc" on >/dev/null 2>&1 || true
+    networksetup -setsecurewebproxystate "$svc" on >/dev/null 2>&1 || true
+    networksetup -setsocksfirewallproxystate "$svc" on >/dev/null 2>&1 || true
+  done < <(network_services)
+}
+
+proxy_url_label() {
+  ruby -ruri -e '
+    uri = URI(ARGV.fetch(0))
+    if uri.host.to_s.empty? || uri.port.nil?
+      puts "invalid"
+    else
+      puts "#{uri.host}:#{uri.port}"
+    end
+  ' "$1" 2>/dev/null || printf 'invalid\n'
+}
+
+check_direct_health() {
+  local ok=0
+  local code
+  local urls=(
+    "https://www.google.com/generate_204"
+    "https://api.github.com"
+  )
+  local url
+  for url in "${urls[@]}"; do
+    code="$(curl --max-time 6 --noproxy '*' -sS -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+    if http_reachable_code "$code"; then
+      ok=$((ok + 1))
+    fi
+  done
+  printf '%s\n' "$ok"
+}
+
+update_providers() {
+  local providers provider enc code
+  providers="$(api GET /providers/proxies 2>/dev/null | jq -r '.providers | keys[]?' 2>/dev/null || true)"
+  if [[ -z "$providers" ]]; then
+    log "provider update: no proxy providers found"
+    return 0
+  fi
+  while IFS= read -r provider; do
+    [[ -z "$provider" ]] && continue
+    enc="$(urlencode "$provider")"
+    code="$(api_code PUT "/providers/proxies/${enc}" 2>/dev/null || true)"
+    log "provider update: ${provider} code=${code}"
+    code="$(api_code GET "/providers/proxies/${enc}/healthcheck" 2>/dev/null || true)"
+    log "provider healthcheck: ${provider} code=${code}"
+  done <<< "$providers"
+}
+
+delay_groups() {
+  local groups group enc code
+  local test_url
+  test_url="$(urlencode 'https://www.google.com/generate_204')"
+  groups="$(api GET /proxies 2>/dev/null |
+    jq -r '
+      (["GLOBAL","♻️ 自动选择","🔰 节点选择","🐟 漏网之鱼"][] as $n |
+        select(.proxies[$n] and (.proxies[$n].all != null)) | $n),
+      (.proxies | to_entries[] | select(.value.all != null) | .key)
+    ' 2>/dev/null |
+    awk '!seen[$0]++' |
+    head -n 6 || true)"
+  if [[ -z "$groups" ]]; then
+    log "delay: no proxy groups found"
+    return 0
+  fi
+  while IFS= read -r group; do
+    [[ -z "$group" ]] && continue
+    enc="$(urlencode "$group")"
+    code="$(api_code GET "/group/${enc}/delay?url=${test_url}&timeout=5000" 2>/dev/null || true)"
+    log "delay: ${group} code=${code}"
+  done <<< "$groups"
+}
+
+active_remote_profile_info() {
+  ruby -ryaml -e '
+    path = ARGV.fetch(0)
+    data = YAML.load_file(path)
+    current = data["current"]
+    item = (data["items"] || []).find { |entry| entry["uid"] == current }
+    abort "current profile is not remote" unless item && item["type"] == "remote"
+    abort "current profile missing file/url" if item["file"].to_s.empty? || item["url"].to_s.empty?
+    puts [item["uid"], item["name"], item["file"], item["url"]].join("\t")
+  ' "$PROFILES_YAML"
+}
+
+url_host() {
+  ruby -ruri -e 'puts((URI(ARGV.fetch(0)).host rescue nil).to_s)' "$1"
+}
+
+profile_yaml_valid() {
+  local path="$1"
+  if head -n 20 "$path" | grep -Eiq '<!doctype|<html|</html>|forbidden|unauthorized|not found|error'; then
+    return 1
+  fi
+  grep -Eq '^[[:space:]]*(-[[:space:]]*)?\{?name:[[:space:]]*.' "$path" &&
+    grep -Eq 'server:[[:space:]]*[^,}]+' "$path" &&
+    grep -Eq 'type:[[:space:]]*(ss|ssr|vmess|vless|trojan|hysteria|hysteria2|tuic|http|socks5|wireguard)' "$path"
+}
+
+mark_profile_updated() {
+  local uid="$1"
+  PROFILE_UID="$uid" ruby -ryaml -e '
+    path = ARGV.fetch(0)
+    data = YAML.load_file(path)
+    item = (data["items"] || []).find { |entry| entry["uid"] == ENV["PROFILE_UID"] }
+    abort "profile uid not found" unless item
+    item["updated"] = Time.now.to_i
+    File.write(path, YAML.dump(data))
+  ' "$PROFILES_YAML"
+}
+
+refresh_active_remote_profile() {
+  local info uid name file url dest tmp backup host bytes
+  info="$(active_remote_profile_info 2>/dev/null)" || {
+    log "profile refresh: no active remote profile"
+    return 1
+  }
+  IFS=$'\t' read -r uid name file url <<< "$info"
+  dest="$PROFILE_DIR/$file"
+  tmp="$STATE_DIR/profile-${uid}.$$.tmp"
+  backup="${dest}.bak-$(date '+%Y%m%d%H%M%S')"
+  host="$(url_host "$url")"
+
+  log "profile refresh: active=${name:-$uid} host=${host:-unknown}"
+  curl --noproxy '*' -L --fail --connect-timeout "${CLASH_PROFILE_REFRESH_CONNECT_TIMEOUT:-20}" \
+    --max-time "${CLASH_PROFILE_REFRESH_TIMEOUT:-120}" \
+    -A "${CLASH_PROFILE_REFRESH_USER_AGENT:-Clash Verge}" \
+    -o "$tmp" "$url" >/dev/null 2>&1 || {
+      rm -f "$tmp"
+      log "profile refresh: download failed active=${name:-$uid} host=${host:-unknown}"
+      return 1
+    }
+
+  bytes="$(wc -c < "$tmp" | tr -d ' ')"
+  if (( bytes < ${CLASH_PROFILE_REFRESH_MIN_BYTES:-1024} )) || ! profile_yaml_valid "$tmp"; then
+    rm -f "$tmp"
+    log "profile refresh: invalid payload bytes=${bytes}"
+    return 1
+  fi
+
+  cp "$dest" "$backup" 2>/dev/null || true
+  mv "$tmp" "$dest"
+  mark_profile_updated "$uid" || true
+  log "profile refresh: updated active=${name:-$uid} bytes=${bytes}"
+}
+
+today_key() {
+  date '+%Y-%m-%d'
+}
+
+daily_refresh_succeeded_today() {
+  [[ -f "$LAST_DAILY_REFRESH_FILE" ]] &&
+    [[ "$(awk 'NR==1 {print $1}' "$LAST_DAILY_REFRESH_FILE" 2>/dev/null)" == "$(today_key)" ]]
+}
+
+mark_daily_refresh_success() {
+  printf '%s %s\n' "$(today_key)" "$(date '+%s')" > "$LAST_DAILY_REFRESH_FILE"
+}
+
+acquire_daily_refresh_lock() {
+  local timeout="${CLASH_DAILY_LOCK_WAIT_SECONDS:-1800}"
+  local interval="${CLASH_DAILY_LOCK_WAIT_INTERVAL:-30}"
+  local start now lock_mtime lock_age elapsed
+  start="$(date '+%s')"
+
+  while ! mkdir "$LOCK_DIR" 2>/dev/null; do
+    now="$(date '+%s')"
+    lock_mtime="$(stat -f '%m' "$LOCK_DIR" 2>/dev/null || echo 0)"
+    lock_age=$((now - lock_mtime))
+    if (( lock_age > ${CLASH_RECOVER_STALE_LOCK_SECONDS:-900} )); then
+      log "daily refresh: stale recovery lock age=${lock_age}s; removing"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      continue
+    fi
+
+    elapsed=$((now - start))
+    if (( elapsed >= timeout )); then
+      log "daily refresh: recovery lock still active after ${elapsed}s; will retry later"
+      return 1
+    fi
+    log "daily refresh: recovery lock active; waiting ${interval}s"
+    sleep "$interval"
+  done
+
+  return 0
+}
+
+prefer_auto_selector() {
+  local auto_name="♻️ 自动选择"
+  local has_auto
+  has_auto="$(api GET /proxies 2>/dev/null |
+    jq -r --arg a "$auto_name" '.proxies.GLOBAL.all // [] | index($a) != null' 2>/dev/null || echo false)"
+  if [[ "$has_auto" == "true" ]]; then
+    api PUT /proxies/GLOBAL "{\"name\":\"${auto_name}\"}" >/dev/null 2>&1 || true
+    log "selector: GLOBAL -> auto"
+  fi
+}
+
+select_healthy_global_candidate() {
+  local port="$1"
+  local max_candidates="${CLASH_RECOVER_MAX_CANDIDATES:-64}"
+  local test_timeout="${CLASH_RECOVER_CANDIDATE_TIMEOUT:-4}"
+  local test_rounds="${CLASH_RECOVER_CANDIDATE_ROUNDS:-2}"
+  local candidates candidate payload ok min_ok total
+  min_ok="$(health_min_ok "$test_rounds")"
+  total="$(health_total "$test_rounds")"
+  candidates="$(api GET /proxies 2>/dev/null |
+    jq -r '
+      (.proxies.GLOBAL.now // empty),
+      (.proxies.GLOBAL.all // [])[]
+    ' 2>/dev/null |
+    awk 'NF && !seen[$0]++' |
+    grep -Ev '^(REJECT|GLOBAL)$' |
+    head -n "$max_candidates" || true)"
+
+  if [[ -z "$candidates" ]]; then
+    log "selector: no GLOBAL candidates to test"
+    return 1
+  fi
+
+  while IFS= read -r candidate; do
+    [[ -z "$candidate" ]] && continue
+    payload="$(jq -cn --arg name "$candidate" '{name:$name}')"
+    api PUT /proxies/GLOBAL "$payload" >/dev/null 2>&1 || true
+    sleep 1
+    ok="$(check_proxy_health "$port" "$test_timeout" "$test_rounds")"
+    log "selector candidate: ${candidate} health=${ok}/${total}"
+    if (( ok >= min_ok )); then
+      log "selector: GLOBAL -> ${candidate}"
+      return 0
+    fi
+  done <<< "$candidates"
+
+  return 1
+}
+
+recover() {
+  if [[ "${CLASH_RECOVER_LOCK_HELD:-0}" != "1" ]] && ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    local lock_age now lock_mtime
+    now="$(date '+%s')"
+    lock_mtime="$(stat -f '%m' "$LOCK_DIR" 2>/dev/null || echo 0)"
+    lock_age=$((now - lock_mtime))
+    if (( lock_age > ${CLASH_RECOVER_STALE_LOCK_SECONDS:-900} )); then
+      log "stale recovery lock age=${lock_age}s; removing"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+      if mkdir "$LOCK_DIR" 2>/dev/null; then
+        trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' RETURN
+      else
+        log "another recovery is running; exit"
+        return 0
+      fi
+    else
+      log "another recovery is running; exit"
+      return 0
+    fi
+  elif [[ "${CLASH_RECOVER_LOCK_HELD:-0}" != "1" ]]; then
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' RETURN
+  fi
+
+  start_app_if_needed || {
+    log "controller still unavailable after opening app"
+    return 2
+  }
+
+  local port original_tun direct_ok proxy_ok min_ok total
+  min_ok="$(health_min_ok)"
+  total="$(health_total "${CLASH_RECOVER_HEALTH_ROUNDS:-2}")"
+  port="$(proxy_port)"
+  original_tun="$(tun_enabled)"
+  printf '%s\n' "$original_tun" > "$DESIRED_TUN_FILE"
+  log "recover start: port=${port} original_tun=${original_tun}"
+
+  if ! proxy_port_listening "$port"; then
+    log "proxy port ${port} is not listening"
+    restart_clash_app || true
+    start_app_if_needed || {
+      log "controller unavailable after restart"
+      return 2
+    }
+    port="$(proxy_port)"
+  fi
+
+  set_system_proxy_off
+  set_tun false
+
+  direct_ok="$(check_direct_health)"
+  log "direct health after downgrade: ${direct_ok}/2"
+
+  update_providers
+  delay_groups
+  prefer_auto_selector
+  select_healthy_global_candidate "$port" || true
+
+  proxy_ok="$(check_proxy_health "$port")"
+  log "local proxy health before reenable: ${proxy_ok}/${total}"
+  if (( proxy_ok >= min_ok )); then
+    reenable_ready_proxy "$port" "$original_tun"
+    sleep 2
+    proxy_ok="$(check_proxy_health "$port")"
+  fi
+  log "proxy health after recover: ${proxy_ok}/${total}"
+  date '+%s' > "$LAST_RECOVER_FILE"
+
+  if (( proxy_ok >= min_ok )); then
+    echo 0 > "$FAIL_FILE"
+    log "recover success"
+    return 0
+  fi
+
+  if [[ -n "${CLASH_FALLBACK_PROXY:-}" ]]; then
+    local fallback_ok
+    fallback_ok="$(check_proxy_url_health "$CLASH_FALLBACK_PROXY")"
+    log "fallback proxy health: ${fallback_ok}/${total} $(proxy_url_label "$CLASH_FALLBACK_PROXY")"
+    if (( fallback_ok >= min_ok )); then
+      set_tun false
+      set_system_proxy_url "$CLASH_FALLBACK_PROXY"
+      echo 0 > "$FAIL_FILE"
+      log "recover success via fallback proxy"
+      return 0
+    fi
+  fi
+
+  log "recover failed; leaving direct path open to avoid dead proxy/TUN state"
+  set_system_proxy_off
+  set_tun false
+  echo 3 > "$FAIL_FILE"
+  return 2
+}
+
+health() {
+  if [[ "${CLASH_RECOVER_LOCK_HELD:-0}" != "1" && -d "$LOCK_DIR" ]]; then
+    local lock_age now lock_mtime
+    now="$(date '+%s')"
+    lock_mtime="$(stat -f '%m' "$LOCK_DIR" 2>/dev/null || echo 0)"
+    lock_age=$((now - lock_mtime))
+    if (( lock_age > ${CLASH_RECOVER_STALE_LOCK_SECONDS:-900} )); then
+      log "health: stale recovery lock age=${lock_age}s; removing"
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+    else
+      log "health: recovery lock active; exit"
+      return 0
+    fi
+  fi
+
+  start_app_if_needed || {
+    log "health: controller unavailable"
+    recover
+    return $?
+  }
+
+  local port ok count now last desired_tun post_ok min_ok total sys_proxy sys_ok
+  min_ok="$(health_min_ok)"
+  total="$(health_total "${CLASH_RECOVER_HEALTH_ROUNDS:-2}")"
+  port="$(proxy_port)"
+  ok="$(check_proxy_health "$port")"
+  log "health: proxy=${ok}/${total} port=${port}"
+
+  if (( ok >= min_ok )); then
+    desired_tun="$(cat "$DESIRED_TUN_FILE" 2>/dev/null || tun_enabled 2>/dev/null || echo false)"
+    sys_proxy="$(system_proxy_url)"
+    if desired_system_proxy_enabled && { ! system_proxy_enabled || [[ -z "$sys_proxy" ]] || ! is_local_proxy_url "$sys_proxy"; }; then
+      log "health: local proxy healthy; re-enabling local system proxy"
+      reenable_ready_proxy "$port" "$desired_tun"
+      sleep 2
+      post_ok="$(check_proxy_health "$port")"
+      log "health: proxy after reenable=${post_ok}/${total}"
+      if (( post_ok < min_ok )); then
+        log "health: reenable made proxy unhealthy; leaving direct path open"
+        set_system_proxy_off
+        set_tun false
+        echo 3 > "$FAIL_FILE"
+        return 1
+      fi
+    elif should_reenable_tun "$desired_tun" && [[ "$(tun_enabled 2>/dev/null || echo false)" != "true" ]]; then
+      log "health: proxy recovered while desired TUN is off; re-enabling TUN"
+      set_tun true
+    fi
+    echo 0 > "$FAIL_FILE"
+    return 0
+  fi
+
+  sys_proxy="$(system_proxy_url)"
+  if [[ -n "$sys_proxy" ]] && ! is_local_proxy_url "$sys_proxy"; then
+    sys_ok="$(check_proxy_url_health "$sys_proxy")"
+    log "health: system_proxy=${sys_ok}/${total} url=${sys_proxy}"
+    if (( sys_ok >= min_ok )); then
+      log "health: fallback proxy is usable, but local proxy remains unhealthy"
+    fi
+  fi
+
+  count="$(cat "$FAIL_FILE" 2>/dev/null || echo 0)"
+  count=$((count + 1))
+  echo "$count" > "$FAIL_FILE"
+  log "health: fail-count=${count}"
+
+  if (( count < ${CLASH_RECOVER_FAIL_THRESHOLD:-2} )); then
+    return 1
+  fi
+
+  now="$(date '+%s')"
+  last="$(cat "$LAST_RECOVER_FILE" 2>/dev/null || echo 0)"
+  if (( now - last < ${CLASH_RECOVER_MIN_INTERVAL:-180} )); then
+    log "health: recovery suppressed by min interval"
+    return 1
+  fi
+
+  recover
+}
+
+daily_refresh() {
+  acquire_daily_refresh_lock || return 1
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' RETURN
+
+  start_app_if_needed || true
+
+  local original_tun profile_refreshed recover_rc
+  original_tun="${CLASH_DAILY_REFRESH_REENABLE_TUN:-true}"
+  profile_refreshed=0
+  printf '%s\n' "$original_tun" > "$DESIRED_TUN_FILE"
+
+  set_system_proxy_off
+  set_tun false
+
+  if refresh_active_remote_profile; then
+    profile_refreshed=1
+  fi
+
+  if (( profile_refreshed )); then
+    CLASH_RECOVER_RESTART_MIN_INTERVAL=0 restart_clash_app || true
+  fi
+  start_app_if_needed || true
+  CLASH_RECOVER_LOCK_HELD=1 recover
+  recover_rc=$?
+  if (( profile_refreshed )) && (( recover_rc == 0 )); then
+    mark_daily_refresh_success
+  fi
+  return "$recover_rc"
+}
+
+daily_refresh_if_needed() {
+  if daily_refresh_succeeded_today; then
+    local port total min_ok local_ok sys_proxy
+    port="$(proxy_port)"
+    total="$(health_total "${CLASH_RECOVER_HEALTH_ROUNDS:-2}")"
+    min_ok="$(health_min_ok)"
+    local_ok="$(check_proxy_health "$port")"
+    sys_proxy="$(system_proxy_url)"
+    if (( local_ok >= min_ok )) && { [[ -z "$sys_proxy" ]] || is_local_proxy_url "$sys_proxy"; }; then
+      log "daily refresh: already succeeded today"
+      return 0
+    fi
+    if (( local_ok >= min_ok )); then
+      log "daily refresh: local proxy healthy but system proxy is not local; restoring local proxy"
+      reenable_ready_proxy "$port" "$(cat "$DESIRED_TUN_FILE" 2>/dev/null || echo true)"
+      return 0
+    fi
+    log "daily refresh: succeeded today but local proxy unhealthy (${local_ok}/${total}); retrying"
+    rm -f "$LAST_DAILY_REFRESH_FILE"
+  fi
+  daily_refresh
+}
+
+case "$MODE" in
+  health) health ;;
+  recover|--force|force) recover ;;
+  daily-refresh|daily_refresh) daily_refresh ;;
+  daily-refresh-if-needed|daily_refresh_if_needed) daily_refresh_if_needed ;;
+  status)
+    port="$(proxy_port 2>/dev/null || echo 7897)"
+    total="$(health_total "${CLASH_RECOVER_HEALTH_ROUNDS:-2}")"
+    printf 'controller=%s\n' "$(api GET /version >/dev/null 2>&1 && echo ok || echo down)"
+    printf 'tun=%s\n' "$(tun_enabled 2>/dev/null || echo unknown)"
+    printf 'system_proxy=%s\n' "$(system_proxy_enabled && echo on || echo off)"
+    printf 'system_proxy_url=%s\n' "$(system_proxy_url)"
+    printf 'proxy_port_listening=%s\n' "$(proxy_port_listening "$port" && echo yes || echo no)"
+    printf 'local_proxy_health=%s/%s\n' "$(check_proxy_health "$port")" "$total"
+    sys_proxy="$(system_proxy_url)"
+    if [[ -n "$sys_proxy" ]] && ! is_local_proxy_url "$sys_proxy"; then
+      printf 'system_proxy_health=%s/%s\n' "$(check_proxy_url_health "$sys_proxy")" "$total"
+    fi
+    if [[ -n "${CLASH_FALLBACK_PROXY:-}" ]]; then
+      printf 'fallback_proxy_health=%s/%s\n' "$(check_proxy_url_health "$CLASH_FALLBACK_PROXY")" "$total"
+    fi
+    printf 'daily_refresh_success=%s\n' "$(cat "$LAST_DAILY_REFRESH_FILE" 2>/dev/null || echo never)"
+    ;;
+  *)
+    echo "usage: $0 [health|recover|daily-refresh|daily-refresh-if-needed|status|--force]" >&2
+    exit 64
+    ;;
+esac
